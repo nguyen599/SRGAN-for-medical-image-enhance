@@ -44,7 +44,7 @@ I train my network on the [Chest X-Ray Images (Pneumonia)](https://www.kaggle.co
     </tr>
 </table>
 
-### Denpendency
+### Dependency
 * python3.10
 * tensorflow2.15
 * The code is work on Ubuntu 20.04.6 LTS
