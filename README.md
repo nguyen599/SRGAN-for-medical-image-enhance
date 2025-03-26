@@ -1,7 +1,7 @@
 # SRGAN: Super-Resolution with Generative Adversarial Networks
 
 ### Introduction
-This project is a tensorflow implementation of the impressive work  [Photo-Realistic Single Image Super-Resolution Using a Generative Adversarial Network](https://arxiv.org/pdf/1609.04802.pdf).
+This project is a re-implementation of the impressive work  [Photo-Realistic Single Image Super-Resolution Using a Generative Adversarial Network](https://arxiv.org/pdf/1609.04802.pdf).
 
 In this work, we focus on reimplement and optimizing SRGAN for multi-GPU and TPU systems to accelerate training and unleash its full potential in high-performance computing environments and testing on medical image.
 
