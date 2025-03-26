@@ -46,7 +46,8 @@ I train my network on the [Chest X-Ray Images (Pneumonia)](https://www.kaggle.co
 
 ### Dependency
 * python3.10
-* tensorflow2.15
+* tensorflow==2.17.1
+* torch==2.5.1
 * The code is work on Ubuntu 20.04.6 LTS
 
 ### Recommended
