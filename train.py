@@ -1,130 +1,173 @@
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+import time
 import numpy as np
-from matplotlib import pylot as plt
-import tensorflow as tf
-from loss_func import *
-from .model import Generator, Discriminator
+import glob
+from matplotlib import pyplot as plt
+# import ignite
+import torch
+from torch import nn
+from torch import optim
+from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
+# import torch_tensorrt
+import torchvision as tv
+import torchvision.transforms.v2 as tr
+from torchmetrics.image import PeakSignalNoiseRatio as PSNR, StructuralSimilarityIndexMeasure as SSIM
 
-with strategy.scope():
-    g = Generator()
-    d = Discriminator()
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import (
+    DistributedSampler,
+)  # Distribute data across multiple gpus
+from torch.distributed import init_process_group, destroy_process_group
+torch.backends.cuda.matmul.allow_tf32 = True
 
-    g_optimizer = tf.keras.optimizers.Adam(1e-4)
-    d_optimizer = tf.keras.optimizers.Adam(1e-4)
+from.model import Generator_2, Discriminator_2, SRGAN
+from loss_func import gen_loss_fn, disc_loss_fn
 
-    generator_loss = gen_loss_fn
-    discriminator_loss = disc_loss_fn
-    loss_fn1 = tf.keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-    loss_fn2 = tf.keras.losses.MeanSquaredError()
-    psnr_calc = compute_psnr
-    ssim_calc = compute_ssim
-
-    g_loss_metric = tf.keras.metrics.Mean(name='g_loss')
-    mse_loss_metric = tf.keras.metrics.Mean(name='mse_loss')
-    g_gan_loss_metric = tf.keras.metrics.Mean(name='g_gan_loss')
-    vgg_loss_metric = tf.keras.metrics.Mean(name='vgg_loss')
-    d_loss_metric = tf.keras.metrics.Mean(name='d_loss')
-    psnr_metric = tf.keras.metrics.Mean(name='psnr')
-    ssim_metric = tf.keras.metrics.Mean(name='ssim')
-
-with strategy.scope():
-
-    @tf.function
-    def train_step(image):
-        lr, hr = image
-        print(hr.shape)
-        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-
-            # Generator
-            fake_hr = g(lr, training = True)
-            mse_loss, g_gan_loss, vgg_loss = generator_loss(d, loss_fn1, loss_fn2, hr, fake_hr)
-            g_loss = mse_loss + g_gan_loss + vgg_loss
-
-            # Discriminator
-            d_hr_pred, d_hr_pred_logits = d(hr)
-            d_hr_fake_pred, d_hr_fake_pred_logits = d(fake_hr)
-            d_loss = discriminator_loss(loss_fn1, d_hr_pred_logits, d_hr_fake_pred_logits)
-        generator_gradients = gen_tape.gradient(g_loss, g.trainable_variables)
-        discriminator_gradients = disc_tape.gradient(d_loss, d.trainable_variables)
-
-        g_optimizer.apply_gradients(zip(generator_gradients, g.trainable_variables))
-        d_optimizer.apply_gradients(zip(discriminator_gradients, d.trainable_variables))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-        psnr = psnr_calc(hr, fake_hr)
-        ssim = ssim_calc(hr, fake_hr)
+LR_IMG_SIZE = (96,96)
+HR_IMG_SIZE = (384,384)
+CHANNELS_NUM = 3
+BATCH_SIZE_PER_REPLICA = 32
+# GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA
 
-        d_loss_metric.update_state(d_loss)
-        g_loss_metric.update_state(g_loss)
-        mse_loss_metric.update_state(mse_loss)
-        g_gan_loss_metric.update_state(g_gan_loss)
-        vgg_loss_metric.update_state(vgg_loss)
-        psnr_metric.update_state(psnr)
-        ssim_metric.update_state(ssim)
+class CustomDataset(Dataset):
+    def __init__(self, file_names, transform, target_transform):
+        self.file_names = file_names
+        self.transform = transform
+        self.target_transform = target_transform
 
-        return d_loss_metric.result(),\
-                g_loss_metric.result(),\
-                mse_loss_metric.result(),\
-                g_gan_loss_metric.result(),\
-                vgg_loss_metric.result(), psnr_metric.result(), ssim_metric.result()
+    def __len__(self):
+        return len(self.file_names)
 
-    @tf.function
-    def distributed_train_step(dataset_inputs):
-        per_replica_losses = strategy.run(train_step, args=(dataset_inputs,))
-        x = []
-        for loss in per_replica_losses:
-            x.append(strategy.reduce(tf.distribute.ReduceOp.MEAN, loss, axis=None))
-        x = tf.stack(x)
-        return x
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
 
-    @tf.function
-    def distributed_train_epoch(train_dist_dataset):
-        loss = tf.constant(0.0, dtype=tf.float32, shape=(7,))
-        num_batches = 0.0
-        for x in train_dist_dataset:
-            loss += distributed_train_step(x)
-            num_batches += 1.0
-        loss = loss / num_batches
-        return loss
+        label = tv.io.read_image(self.file_names[idx])
 
-#     @tf.function
-    def distributed_test_epoch(g_model, test_dist_dataset, img_convert = True):
+        if self.target_transform:
+            label = self.target_transform(label)
 
-        permanent_sample = next(iter(test_dist_dataset))
+        if self.transform:
+            image = self.transform(label)
 
-        val_dataset_shuffled = test_dist_dataset.shuffle(buffer_size=len(hr_val_filenames))
+        return image, label
 
-        random_samples = val_dataset_shuffled.take(2)
+def create_dataloader(img_filenames, transform = None, target_transform = None,
+                      batch_size=12, shuffle=True, use_sampler = False, num_workers=2):
+    dataset = CustomDataset(img_filenames, transform, target_transform)
+    if use_sampler:
+        shuffle = False
+        sampler = DistributedSampler(dataset)
+    else:
+        sampler = None
 
-        fig, ax = plt.subplots(3,3, figsize=(12,12))
-        if img_convert:
-            ax[0,0].imshow(np.round((permanent_sample[0][0]+1)*127.5).astype('uint8'))
-            ax[0,1].imshow(np.round(((g_model(tf.expand_dims(permanent_sample[0][0], axis = 0))[0] + 1) * 127.5).numpy()).astype('uint8'))
-            ax[0,2].imshow(np.round((permanent_sample[1][0]+1)*127.5).astype('uint8'))
-            ax[0,0].set_yticklabels([])
-            ax[0,1].set_yticklabels([])
-            ax[0,2].set_yticklabels([])
+    dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = shuffle, sampler = sampler,
+                            pin_memory = True, num_workers = num_workers,
+                            drop_last=True, generator=torch.Generator(device='cpu'))
+    return dataloader
 
-            for i, batch in enumerate(random_samples):
-                lr_batch, hr_batch = batch
-                ax[i+1,0].imshow(np.round(((lr_batch[0]+1)*127.5)).astype('uint8'))
-                ax[i+1,1].imshow(np.round(((g_model(tf.expand_dims(lr_batch[0], axis = 0))[0] + 1) * 127.5).numpy()).astype('uint8'))
-                ax[i+1,2].imshow(np.round(((hr_batch[0]+1)*127.5)).astype('uint8'))
-                ax[i+1,0].set_yticklabels([])
-                ax[i+1,1].set_yticklabels([])
-                ax[i+1,2].set_yticklabels([])
-        else:
-            ax[0,0].imshow(permanent_sample[0][0])
-            ax[0,1].imshow(g_model(permanent_sample[0])[0])
-            ax[0,2].imshow(permanent_sample[1][0])
+def train_epoch(srgan, train_dataloader, g_optimizer, d_optimizer, device):
+    srgan.train()
+    loss = torch.tensor([0.0] * 7, device = device)
+    for idx, (lr, hr) in enumerate(train_dataloader):
+        lr = lr.to(device)
+        hr = hr.to(device)
 
-            for i, batch in enumerate(random_samples):
-                lr_batch, hr_batch = batch
-                ax[i+1,0].imshow(lr_batch[0])
-                ax[i+1,1].imshow(((g_model(lr_batch)[0])))
-                ax[i+1,2].imshow(hr_batch[0])
+        loss += srgan.train_step(lr, hr, g_optimizer, d_optimizer)
+
+    loss = loss / len(train_dataloader)
+
+    return loss
+
+def test_epoch(gen, dataloader):
+    gen.eval()
+    with torch.no_grad():
+        lr_val_samples, hr_val_samples = next(iter(dataloader))
+
+        fig, ax = plt.subplots(3,3, figsize=(14,14))
+
+        for i in range(3):
+            ax[i,0].imshow(((lr_val_samples[i].permute(1, 2, 0)+1)*127.5).type(torch.uint8))
+            ax[i,1].imshow(((gen(lr_val_samples.to(device))[i].cpu()+1)*127.5).type(torch.uint8).permute(1, 2, 0))
+            ax[i,2].imshow(((hr_val_samples[i].permute(1, 2, 0)+1)*127.5).type(torch.uint8))
+            ax[i,0].set_yticklabels([])
+            ax[i,1].set_yticklabels([])
+            ax[i,2].set_yticklabels([])
         plt.subplots_adjust(wspace=0.05, hspace=0.05)
         plt.show()
 
-        save_options = tf.saved_model.SaveOptions(experimental_io_device='/job:localhost')
-        tf.saved_model.save(g,export_dir = '/kaggle/working/gen', options=save_options)
-        tf.saved_model.save(d,export_dir = '/kaggle/working/disc', options=save_options)
+if __name__ == '__main__':
+    target_transform = tr.Compose([tr.RandomCrop(HR_IMG_SIZE),
+                                tr.RandomHorizontalFlip(p=0.5),
+                                tr.ToDtype(torch.float32, scale=True),
+                                tr.Normalize(mean = [0.5 for _ in range(CHANNELS_NUM)],
+                                                std = [0.5 for _ in range(CHANNELS_NUM)])
+                                ])
+
+    transform = tr.Compose([tr.Resize(LR_IMG_SIZE, antialias=True)])
+
+
+    val_target_transform = tr.Compose([tr.Resize(HR_IMG_SIZE, antialias=True),
+                                    tr.ToDtype(torch.float32, scale=True),
+                                    tr.Normalize(mean = [0.5 for _ in range(CHANNELS_NUM)],
+                                                    std = [0.5 for _ in range(CHANNELS_NUM)])
+                                    ])
+
+    val_transform = tr.Compose([tr.Resize(LR_IMG_SIZE, antialias=True)])
+
+    hr_train_filenames = glob.glob('/kaggle/input/my-div2k-dataset/DIV2K_train_HR/*.png')
+    hr_val_filenames = glob.glob('/kaggle/input/my-div2k-dataset/DIV2K_valid_HR/*.png')
+    print(len(hr_train_filenames))
+    print(len(hr_val_filenames))
+    BATCH_SIZE = 16
+    USE_SAMPLER = True
+    train_dataloader = create_dataloader(hr_train_filenames, transform, target_transform,
+                                        batch_size = BATCH_SIZE, shuffle = True, num_workers = 4)
+    val_dataloader = create_dataloader(hr_val_filenames, val_transform, val_target_transform,
+                                    batch_size = 16, shuffle = False, use_sampler = USE_SAMPLER, num_workers = 4)
+
+    from torchvision.models.vgg import vgg19
+    vgg = vgg19(weights = tv.models.VGG19_Weights.DEFAULT)
+    vgg = nn.Sequential(*list(vgg.features)[:31]).eval()
+    for param in vgg.parameters():
+        param.requires_grad = False
+    vgg = vgg.to(device)
+
+    # torch._dynamo.list_backends()
+    # ['cudagraphs', 'inductor', 'onnxrt', 'openxla', 'openxla_eval', 'tvm']
+    # torch.compile(model, backend="torch_tensorrt")
+    from torch._dynamo.backends.common import aot_autograd
+    from functorch.compile import make_boxed_func
+
+    def my_compiler(gm, example_inputs):
+        return make_boxed_func(gm.forward)
+
+    my_backend = aot_autograd(fw_compiler=my_compiler)  # bw_compiler=my_compiler
+
+    generator = Generator_2()
+    generator = torch.compile(generator, fullgraph=True, backend = my_backend).to(device)
+    discriminator = Discriminator_2()
+    discriminator = torch.compile(discriminator, fullgraph=True, backend = my_backend).to(device)
+    srgan = SRGAN(generator, discriminator, gen_loss_fn, disc_loss_fn)
+    srgan = torch.compile(srgan, fullgraph=True, backend = my_backend).to(device)
+
+    g_optimizer = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
+
+    metric_names = ['d_loss', 'g_loss', 'mse_loss', 'g_gan_loss', 'vgg_loss', 'psnr', 'ssim']
+
+    num_epochs = 5
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        print(f"Epoch [{epoch+1}/{num_epochs}]")
+        loss = train_epoch(srgan, train_dataloader, g_optimizer, d_optimizer, device)
+        print(f"ETA: {np.round(time.time() - start_time)}s {', '.join([f'{metric_name}: {value:.6f}' for metric_name, value in zip(metric_names, loss)])}")
+        if (epoch +1) % 5 == 0:
+            test_epoch(generator, val_dataloader)
